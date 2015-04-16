@@ -145,52 +145,28 @@ Mx: %d
 	}
 
 	var results []IGD
-	resultChannel := make(chan IGD, 8)
+	resultChannel := make(chan IGD, 64)
 
-	socket, err := net.ListenMulticastUDP("udp4", nil, &net.UDPAddr{IP: ssdp.IP})
+	interfaces, err := net.Interfaces()
 	if err != nil {
-		l.Infoln(err)
+		l.Infoln("upnp interfaces:", err)
 		return results
-	}
-	defer socket.Close() // Make sure our socket gets closed
-
-	err = socket.SetDeadline(time.Now().Add(timeout))
-	if err != nil {
-		l.Infoln(err)
-		return results
-	}
-
-	if debug {
-		l.Debugln("Sending search request for device type " + deviceType + "...")
 	}
 
 	var resultWaitGroup sync.WaitGroup
 
-	_, err = socket.WriteTo(search, ssdp)
-	if err != nil {
-		l.Infoln(err)
-		return results
-	}
-
-	if debug {
-		l.Debugln("Listening for UPnP response for device type " + deviceType + "...")
-	}
-
-	// Listen for responses until a timeout is reached
-	for {
-		resp := make([]byte, 1500)
-		n, _, err := socket.ReadFrom(resp)
-		if err != nil {
-			if e, ok := err.(net.Error); !ok || !e.Timeout() {
-				l.Infoln(err) //legitimate error, not a timeout.
-			}
-
-			break
-		} else {
-			// Process results in a separate go routine so we can immediately return to listening for more responses
-			resultWaitGroup.Add(1)
-			go handleSearchResponse(deviceType, knownDevices, resp, n, resultChannel, &resultWaitGroup)
+	for _, intf := range interfaces {
+		if debug {
+			l.Debugln("Sending search request for device type " + deviceType + " over interface " + intf.Name)
 		}
+		resultWaitGroup.Add(1)
+		go func(interf net.Interface) {
+			for _, response := range sendMulticast(interf, ssdp, timeout, search) {
+				handleSearchResponse(deviceType, knownDevices, response, resultChannel)
+			}
+			resultWaitGroup.Done()
+		}(intf)
+
 	}
 
 	// Wait for all result handlers to finish processing, then close result channel
@@ -220,14 +196,48 @@ Mx: %d
 	return results
 }
 
-func handleSearchResponse(deviceType string, knownDevices []IGD, resp []byte, length int, resultChannel chan<- IGD, resultWaitGroup *sync.WaitGroup) {
-	defer resultWaitGroup.Done() // Signal when we've finished processing
+func sendMulticast(intf net.Interface, address *net.UDPAddr, timeout time.Duration, message []byte) [][]byte {
+	responses := make([][]byte, 0)
+	socket, err := net.ListenMulticastUDP("udp4", &intf, &net.UDPAddr{IP: address.IP})
+	if err != nil {
+		l.Infoln(err)
+		return responses
+	}
+	defer socket.Close() // Make sure our socket gets closed
 
-	if debug {
-		l.Debugln("Handling UPnP response:\n\n" + string(resp[:length]))
+	err = socket.SetDeadline(time.Now().Add(timeout))
+	if err != nil {
+		l.Infoln(err)
+		return responses
 	}
 
-	reader := bufio.NewReader(bytes.NewBuffer(resp[:length]))
+	_, err = socket.WriteTo(message, address)
+	if err != nil {
+		l.Infoln(err)
+		return responses
+	}
+
+	// Listen for responses until a timeout is reached
+	for {
+		resp := make([]byte, 1500)
+		n, _, err := socket.ReadFrom(resp)
+		if err != nil {
+			if e, ok := err.(net.Error); !ok || !e.Timeout() {
+				l.Infoln(err) //legitimate error, not a timeout.
+			}
+			break
+		}
+		responses = append(responses, resp[:n])
+	}
+	return responses
+}
+
+func handleSearchResponse(deviceType string, knownDevices []IGD, resp []byte, resultChannel chan<- IGD) {
+	if debug {
+		l.Debugln("Handling UPnP response:\n\n" + string(resp))
+	}
+
+	reader := bufio.NewReader(bytes.NewBuffer(resp))
 	request := &http.Request{}
 	response, err := http.ReadResponse(reader, request)
 	if err != nil {
